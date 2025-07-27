@@ -6,7 +6,7 @@ import socket
 import atexit
 import cohere
 import tempfile
-import warnings
+import tracemalloc
 import streamlit as st
 import google.generativeai as genai
 from datetime import datetime, timedelta
@@ -30,33 +30,6 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 co = cohere.Client(COHERE_API_KEY)
 
-if 'cohere_calls' not in st.session_state:
-    st.session_state.cohere_calls = []
-COHERE_RATE_LIMIT = 100
-RATE_LIMIT_WINDOW = 60
-
-def check_rate_limit():
-    current_time = datetime.now()
-    st.session_state.cohere_calls = [
-        call_time for call_time in st.session_state.cohere_calls 
-        if current_time - call_time < timedelta(seconds=RATE_LIMIT_WINDOW)
-    ]
-    
-    if len(st.session_state.cohere_calls) >= COHERE_RATE_LIMIT:
-        oldest_call = min(st.session_state.cohere_calls)
-        wait_time = RATE_LIMIT_WINDOW - (current_time - oldest_call).seconds
-        if wait_time > 0:
-            with st.sidebar:
-                with st.spinner(f"⏳ Rate limit reached. Waiting {wait_time} seconds..."):
-                    time.sleep(wait_time)
-            st.session_state.cohere_calls = []
-    
-    st.session_state.cohere_calls.append(current_time)
-
-def rate_limited_embed(texts, model, input_type):
-    check_rate_limit()
-    return co.embed(texts=texts, model=model, input_type=input_type)
-
 client = None
 
 def get_client():
@@ -68,6 +41,7 @@ def get_client():
                 cluster_url=WEAVIATE_URL,
                 auth_credentials=Auth.api_key(WEAVIATE_API_KEY)
             )
+            atexit.register(cleanup_client)
         return client
     except Exception as e:
         st.error(f"Failed to connect to Weaviate: {str(e)}")
@@ -79,31 +53,37 @@ def cleanup_client():
     try:
         if client:
             client.close()
-            for conn in ssl.SSLSocket._client_sockets:
-                try:
-                    conn.close()
-                except:
-                    pass
-            ssl.SSLSocket._client_sockets.clear()
             client = None
+            
+            for obj in gc.get_objects():
+                if isinstance(obj, ssl.SSLSocket):
+                    try:
+                        obj.close()
+                    except:
+                        pass
     except Exception as e:
         st.error(f"Error during cleanup: {str(e)}")
 
 def safe_cleanup():
-    cleanup_client()
-    gc.collect(0)
-    gc.collect(1)
-    gc.collect(2)
+    tracemalloc.start()
     
     try:
+        cleanup_client()
+        
+        gc.collect(0)
+        gc.collect(1)
+        gc.collect(2)
+        
         for obj in gc.get_objects():
-            if isinstance(obj, socket.socket):
+            if isinstance(obj, (socket.socket, ssl.SSLSocket)):
                 try:
                     obj.close()
                 except:
                     pass
-    except:
-        pass
+    except Exception as e:
+        st.error(f"Error during final cleanup: {str(e)}")
+    finally:
+        tracemalloc.stop()
 
 COLLECTION_NAME = "DocumentChunks"
 
@@ -146,27 +126,67 @@ def index_documents(docs):
     collection = get_collection()
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
-    for chunk in chunks:
-        embedding = rate_limited_embed(
-            texts=[chunk.page_content],
-            model="embed-english-v3.0",
-            input_type="search_document"
-        ).embeddings[0]
-        collection.data.insert(
-            properties={
-                "text": chunk.page_content,
-                "source": chunk.metadata.get("source", "unknown"),
-            },
-            vector=embedding
-        )
+    total_chunks = len(chunks)
+    
+    if total_chunks > 100:
+        st.error("⚠️ Source Exceeded Free Tier Limit!")
+        return False
+    
+    progress_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    try:
+        for i, chunk in enumerate(chunks):
+            progress = (i + 1) / total_chunks
+            progress_bar.progress(progress)
+            # progress_text.text(f"Indexing {i + 1} of {total_chunks}...")
+            
+            try:
+                embedding = co.embed(
+                    texts=[chunk.page_content],
+                    model="embed-english-v3.0",
+                    input_type="search_document"
+                ).embeddings[0]
+                
+                collection.data.insert(
+                    properties={
+                        "text": chunk.page_content,
+                        "source": chunk.metadata.get("source", "unknown"),
+                    },
+                    vector=embedding
+                )
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg or "rate limit" in error_msg.lower():
+                    progress_text.empty()
+                    progress_bar.empty()
+                    st.error("⚠️ Cohere API Rate Limit Reached!")
+                    return False
+                raise e
+        
+        progress_text.empty()
+        progress_bar.empty()
+        return True
+        
+    except Exception as e:
+        progress_text.empty()
+        progress_bar.empty()
+        raise Exception(f"Error during indexing: {str(e)}")
 
 def query_vector_db(query, selected_sources):
     collection = get_collection()
-    query_vec = rate_limited_embed(
-        texts=[query],
-        model="embed-english-v3.0",
-        input_type="search_query"
-    ).embeddings[0]
+    try:
+        query_vec = co.embed(
+            texts=[query],
+            model="embed-english-v3.0",
+            input_type="search_query"
+        ).embeddings[0]
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "rate limit" in error_msg.lower():
+            st.error("⚠️ Cohere API Rate Limit Reached!")
+            return None
+        raise e
 
     filters = None
     if selected_sources:
@@ -223,18 +243,18 @@ with st.sidebar:
         if not uploaded_files:
             st.warning("⚠️ Please upload sources.")
         else:
-            with st.spinner("📥 Indexing sources..."):
-                try:
-                    docs = load_documents(uploaded_files)
-                    if docs:
-                        index_documents(docs)
-                        st.success(f"✅ {len(docs)} sources indexed!")
-                        st.rerun()
-                    else:
-                        st.warning("⚠️ No sources loaded.")
-                except Exception as e:
-                    st.error(f"⚠️ Indexing error! \n{str(e)}")
-                    safe_cleanup()
+            try:
+                docs = load_documents(uploaded_files)
+                if docs:
+                    with st.spinner("📥 Indexing sources..."):
+                        if index_documents(docs):
+                            st.success(f"✅ {len(docs)} sources indexed!")
+                            st.rerun()
+                else:
+                    st.warning("⚠️ No sources loaded.")
+            except Exception as e:
+                st.error(f"⚠️ Indexing error! \n{str(e)}")
+                safe_cleanup()
     
     if st.button("🗑️ Delete Sources", use_container_width=True, type="secondary"):
         try:
@@ -259,7 +279,6 @@ with st.sidebar:
         if st.button("🗑️ Clear Chat", use_container_width=True, type="secondary"):
             st.session_state.messages = []
             st.rerun()
-
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
