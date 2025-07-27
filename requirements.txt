@@ -1,0 +1,8 @@
+streamlit
+langchain
+langchain-community
+cohere
+weaviate-client>=4.0.0
+google-generativeai
+python-dotenv
+pypdf
