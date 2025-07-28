@@ -4,19 +4,19 @@ import ssl
 import time
 import socket
 import atexit
-import cohere
 import tempfile
+from datetime import datetime, timedelta
 import tracemalloc
 import streamlit as st
-import google.generativeai as genai
-from datetime import datetime, timedelta
+import cohere
 from dotenv import load_dotenv
+import google.generativeai as genai
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from weaviate import connect_to_weaviate_cloud
 from weaviate.auth import Auth
-from weaviate.collections.classes.config import Property, DataType, _Vectorizer
 from weaviate.collections import Collection
+from weaviate.collections.classes.config import Property, DataType, _Vectorizer
 from weaviate.classes.query import Filter, MetadataQuery
 
 load_dotenv()
